@@ -7,6 +7,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -16,6 +17,8 @@ import (
 )
 
 type ms struct {
+	// guards subscriptions and series mutation against the GC sweep
+	mu                 *sync.RWMutex
 	store              *t.Map[string, *t.Map[t.LabelsHash, *t.MetricData]]
 	stalePeriodSeconds int
 	metricsExporter    *InternalMetrics
@@ -29,6 +32,7 @@ func NewMetricStore(cfg *util.Config) t.MemStore {
 	m := Metrics()
 	m.Init()
 	return ms{
+		mu:                 &sync.RWMutex{},
 		store:              &t.Map[string, *t.Map[t.LabelsHash, *t.MetricData]]{},
 		stalePeriodSeconds: cfg.MetricStoreRetentionSeconds,
 		metricsExporter:    m,
@@ -51,6 +55,8 @@ func (m ms) Get(unescapedName t.MetricName, searchLabels t.Labels, timeOp t.Oper
 }
 
 func (m ms) get(name t.MetricName, searchLabels t.Labels, timeOp t.OperationOverTime, vecOp t.AggregationOverVectors) (float64, t.Found, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	now := time.Now().Unix()
 	if err := util.CheckTimeOp(timeOp); err != nil {
 		return m.valIfNotFound, false, err
@@ -90,7 +96,7 @@ func (m ms) get(name t.MetricName, searchLabels t.Labels, timeOp t.OperationOver
 	// multiple metric vectors match the search criteria
 	var accumulator float64
 	counter := 0
-	storedMetrics.Range(func(_ t.LabelsHash, md *t.MetricData) bool {
+	storedMetrics.Range(func(key t.LabelsHash, md *t.MetricData) bool {
 		match := true
 		for searchLabelName, searchLabelVal := range searchLabels {
 			if v, found := md.Labels[searchLabelName]; found && v != searchLabelVal {
@@ -107,9 +113,7 @@ func (m ms) get(name t.MetricName, searchLabels t.Labels, timeOp t.OperationOver
 				counter += 1
 				accumulator = m.calculateAggregate(val, counter, accumulator, vecOp)
 			} else {
-				defer func() {
-					storedMetrics.Delete(hashOfMap(searchLabels))
-				}()
+				storedMetrics.Delete(key)
 			}
 		}
 		return true
@@ -120,16 +124,19 @@ func (m ms) get(name t.MetricName, searchLabels t.Labels, timeOp t.OperationOver
 // Put stores the t.NewMetricEntry in the metric store and updates the stored aggregates
 func (m ms) Put(entry t.NewMetricEntry) {
 	name := escapeName(entry.Name)
+	labelsH := hashOfMap(entry.Labels)
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if (m.lazySeries || m.lazyAggregates) && len(m.subscriptions[name]) == 0 {
 		// nobody has been listening yet
 		return
 	}
 	metrics, _ := m.store.LoadOrStore(string(name), &t.Map[t.LabelsHash, *t.MetricData]{})
-	labelsH := hashOfMap(entry.Labels)
 	md, found := metrics.LoadOrStore(labelsH, newFirstMetricDatapoint(entry, m.lazyAggregates))
 	m.metricsExporter.IncMetricWrite(string(name))
 	now := time.Now().Unix()
 	if found {
+		md.LastWrite = time.Now()
 		notStale := util.Filter(md.Data, func(val t.ObservedValue) bool {
 			return !m.isStale(val.Time, now)
 		})
@@ -145,7 +152,36 @@ func (m ms) Put(entry t.NewMetricEntry) {
 	m.store.Store(string(name), metrics)
 }
 
+// CollectStale uses receipt time, not sample time, so skewed producer timestamps can't expire or pin a series.
+func (m ms) CollectStale(now time.Time, staleAfter time.Duration) int {
+	if staleAfter <= 0 {
+		return 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	removed := 0
+	m.store.Range(func(name string, series *t.Map[t.LabelsHash, *t.MetricData]) bool {
+		empty := true
+		series.Range(func(key t.LabelsHash, md *t.MetricData) bool {
+			if now.Sub(md.LastWrite) > staleAfter {
+				series.Delete(key)
+				removed++
+			} else {
+				empty = false
+			}
+			return true
+		})
+		if empty {
+			m.store.Delete(name)
+		}
+		return true
+	})
+	return removed
+}
+
 func (m ms) IsSubscribed(lazyAggregates bool, name t.MetricName, overTime t.OperationOverTime) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	ops, found := m.subscriptions[name]
 	if !lazyAggregates {
 		return found
@@ -249,6 +285,7 @@ func newFirstMetricDatapoint(entry t.NewMetricEntry, lazyAggregates bool) *t.Met
 	md := t.MetricData{
 		Labels:     entry.Labels,
 		LastUpdate: timeInSeconds,
+		LastWrite:  time.Now(),
 		Data: []t.ObservedValue{
 			{
 				Time:  timeInSeconds,

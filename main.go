@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
@@ -60,6 +61,10 @@ func main() {
 	eg, ctx := errgroup.WithContext(ctx)
 	ms := metric.NewMetricStore(cfg)
 	mp := metric.NewParser()
+	eg.Go(func() error {
+		metric.RunGarbageCollector(ctx, ms, metric.Metrics(), time.Duration(cfg.GCStaleAfterMinutes)*time.Minute)
+		return nil
+	})
 
 	defer metric.Metrics().Unregister()
 	eg.Go(func() error {

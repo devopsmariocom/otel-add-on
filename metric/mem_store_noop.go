@@ -2,6 +2,7 @@ package metric
 
 import (
 	"fmt"
+	"time"
 
 	t "github.com/kedify/otel-add-on/types"
 )
@@ -32,6 +33,10 @@ func (m noopMs) IsSubscribed(_lazyAggregates bool, name t.MetricName, _overTime 
 		fmt.Println("noop metric store called IsSubscribed: " + name)
 	}
 	return false
+}
+
+func (m noopMs) CollectStale(_ time.Time, _ time.Duration) int {
+	return 0
 }
 
 func (m noopMs) GetStore() *t.Map[string, *t.Map[t.LabelsHash, *t.MetricData]] {

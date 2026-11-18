@@ -1,6 +1,10 @@
 package types
 
-import "go.opentelemetry.io/collector/pdata/pcommon"
+import (
+	"time"
+
+	"go.opentelemetry.io/collector/pdata/pcommon"
+)
 
 type NewMetricEntry struct {
 	// metric name
@@ -25,6 +29,8 @@ type MetricData struct {
 	Data               []ObservedValue                 `json:"data"`
 	AggregatesOverTime Map[OperationOverTime, float64] `json:"aggregatesOverTime"`
 	LastUpdate         uint32                          `json:"lastUpdate"`
+	// receipt time of the last write; unlike LastUpdate it can't be skewed by producer timestamps
+	LastWrite time.Time `json:"-"`
 }
 
 type ObservedValue struct {
@@ -80,6 +86,10 @@ type MemStore interface {
 
 	// IsSubscribed returns true if anyone has called Get for this metric before
 	IsSubscribed(bool, MetricName, OperationOverTime) bool
+
+	// CollectStale drops series that haven't been written for longer than the given duration
+	// and returns how many were removed
+	CollectStale(now time.Time, staleAfter time.Duration) int
 }
 
 type Parser interface {

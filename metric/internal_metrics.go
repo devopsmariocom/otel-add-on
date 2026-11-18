@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	crm "sigs.k8s.io/controller-runtime/pkg/metrics"
@@ -43,6 +44,15 @@ type InternalMetrics struct {
 	registerOnce sync.Once
 	initOnce     sync.Once
 	metrics      collectors
+	valueMu      sync.Mutex
+	valueUpdates map[metricValueLabels]time.Time
+}
+
+// metricValueLabels identifies one exported gauge series
+type metricValueLabels struct {
+	name, labels, timeOp, aggregation string
+	scaledObject, namespace           string
+	clamped                           bool
 }
 
 func Metrics() *InternalMetrics {
@@ -86,6 +96,7 @@ func (m *InternalMetrics) registry() (r map[string]prometheus.Collector) {
 
 func (m *InternalMetrics) Init() {
 	m.initOnce.Do(func() {
+		m.valueUpdates = make(map[metricValueLabels]time.Time)
 		m.metrics.KedaOtelScalerRuntimeInfo = prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Name: KedaOtelScalerRuntimeInfo,
@@ -133,10 +144,39 @@ func (m *InternalMetrics) IncMetricWrite(name string) {
 }
 
 func (m *InternalMetrics) SetMetricValue(name, labels, timeOp, aggregation string, value float64) {
+	m.valueMu.Lock()
+	defer m.valueMu.Unlock()
 	m.metrics.KedaOtelScalerValue.With(prometheus.Labels{"name": name, "labels": labels, "timeOp": timeOp, "aggregation": aggregation}).Set(value)
+	m.valueUpdates[metricValueLabels{name: name, labels: labels, timeOp: timeOp, aggregation: aggregation}] = time.Now()
+}
+
+// CollectStale removes exported gauges that haven't been set for longer than staleAfter
+func (m *InternalMetrics) CollectStale(now time.Time, staleAfter time.Duration) int {
+	if staleAfter <= 0 {
+		return 0
+	}
+	m.valueMu.Lock()
+	defer m.valueMu.Unlock()
+	removed := 0
+	for l, updated := range m.valueUpdates {
+		if now.Sub(updated) <= staleAfter {
+			continue
+		}
+		if l.clamped {
+			m.metrics.KedaOtelScalerValueClamped.DeleteLabelValues(l.name, l.labels, l.timeOp, l.aggregation, l.scaledObject, l.namespace)
+		} else {
+			m.metrics.KedaOtelScalerValue.DeleteLabelValues(l.name, l.labels, l.timeOp, l.aggregation)
+		}
+		delete(m.valueUpdates, l)
+		removed++
+	}
+	return removed
 }
 
 func (m *InternalMetrics) SetMetricValueClamped(name, labels, timeOp, aggregation, scaledObject, namespace string, value float64) {
+	m.valueMu.Lock()
+	defer m.valueMu.Unlock()
+	m.valueUpdates[metricValueLabels{name: name, labels: labels, timeOp: timeOp, aggregation: aggregation, scaledObject: scaledObject, namespace: namespace, clamped: true}] = time.Now()
 	m.metrics.KedaOtelScalerValueClamped.With(prometheus.Labels{
 		"name":         name,
 		"labels":       labels,
